@@ -144,7 +144,7 @@ class NoisePredictionMLP(nn.Module):
 
 
 @torch.no_grad()
-def sample_ddim(model, n_samples, alpha_bars, inference_steps=20, eta=0.0):
+def sample_ddim(model, n_samples, alpha_bars, inference_steps=20, eta=0.0, history=False):
     """
     DDIM Sampling.
     
@@ -153,6 +153,7 @@ def sample_ddim(model, n_samples, alpha_bars, inference_steps=20, eta=0.0):
         eta: 0.0 = Deterministic DDIM (recommended). 
              1.0 = Same behavior as standard DDPM.
     """
+    
     model.eval()
     total_train_steps = len(alpha_bars)
     
@@ -167,6 +168,9 @@ def sample_ddim(model, n_samples, alpha_bars, inference_steps=20, eta=0.0):
     
     # Start from pure noise
     x = torch.randn(n_samples, 2)
+
+    #track history
+    history = [x.numpy().copy()]
     
     print(f"DDIM Sampling with {inference_steps} steps...")
     
@@ -201,5 +205,60 @@ def sample_ddim(model, n_samples, alpha_bars, inference_steps=20, eta=0.0):
             noise = 0
             
         x = np.sqrt(alpha_bar_t_next) * pred_x0 + dir_xt + sigma_t * noise
+        if history:
+            history.append(x.numpy().copy())
             
-    return x.numpy()
+    return x.numpy(), history
+
+
+@torch.no_grad()
+def vector_field_ddim(model, alpha_bars, inference_steps=20, x_values=[], y_values=[]):
+    model.eval()
+    total_train_steps = len(alpha_bars)
+    
+    # 1. Select the specific time steps we will use
+    # e.g., if T=100 and inference_steps=10, we might use [90, 80, ..., 0]
+    times = torch.linspace(0, total_train_steps - 1, inference_steps).long()
+    times = list(reversed(times.tolist())) # Reverse to go from noisy -> clean
+    
+    # Create pairs of (current_step, next_step)
+    # e.g., [(90, 80), (80, 70), ..., (10, 0), (0, -1)]
+    time_pairs = list(zip(times[:-1], times[1:])) + [(times[-1], -1)]
+    
+    # points to get vectors for
+    points = torch.stack([torch.tensor(x_values), torch.tensor(y_values)],dim=1)
+
+    history = []
+    
+    print(f"DDIM Sampling with {inference_steps} steps...")
+    
+    for t_curr, t_next in time_pairs:
+        # Broadcast time for the batch
+        t_tensor = torch.full((len(x_values), 1), t_curr, dtype=torch.float32)
+        
+        # Predict noise
+        model_input = torch.cat([points, t_tensor], dim=1)
+        predicted_noise = model(model_input)
+        
+        # Get alpha_bar values for current and next step
+        alpha_bar_t = alpha_bars[t_curr]
+        alpha_bar_t_next = alpha_bars[t_next] if t_next >= 0 else 1.0
+        
+        # --- DDIM Update Formula ---
+        
+        # 1. Estimate clean x0 (predicted original point)
+        sqrt_alpha_bar_t = np.sqrt(alpha_bar_t)
+        sqrt_one_minus_alpha_bar_t = np.sqrt(1 - alpha_bar_t)
+        pred_x0 = (points - sqrt_one_minus_alpha_bar_t * predicted_noise) / sqrt_alpha_bar_t
+        
+        # 2. Calculate "direction" to point x_{t-1}
+        # (This sigma is 0 when eta=0, making it deterministic)
+        eta=0
+        sigma_t = eta * np.sqrt((1 - alpha_bar_t_next) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_next))
+        dir_xt = np.sqrt(1 - alpha_bar_t_next - sigma_t**2) * predicted_noise
+        
+        history.append(dir_xt.numpy())
+            
+        # points = np.sqrt(alpha_bar_t_next) * pred_x0 + dir_xt + sigma_t * noise
+            
+    return history
